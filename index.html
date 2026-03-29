@@ -1,0 +1,561 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
+import { Play, RotateCcw, UserRound } from 'lucide-react';
+
+// --- Constants ---
+const GRAVITY = 0.6;
+const JUMP_FORCE = -15;
+const PLAYER_X = 150; // Fixed X position of player
+const PLAYER_WIDTH = 50;
+const PLAYER_HEIGHT = 80;
+const GROUND_Y = 350; // Base Y position of the road surface
+const OBSTACLE_SPEED = 8;
+const SPAWN_INTERVAL = 1200; // ms
+const LANES = [0, 1, 2]; // 0: Left, 1: Center, 2: Right
+const LANE_Y_OFFSETS = [-40, 0, 40]; // Visual vertical offsets for lanes
+
+const AVAILABLE_COLORS = [
+  { name: 'Dark Blue', value: 'bg-blue-900', border: 'border-blue-400', head: 'bg-blue-800', detail: 'bg-blue-400' },
+  { name: 'Crimson', value: 'bg-red-900', border: 'border-red-400', head: 'bg-red-800', detail: 'bg-red-400' },
+  { name: 'Emerald', value: 'bg-emerald-900', border: 'border-emerald-400', head: 'bg-emerald-800', detail: 'bg-emerald-400' },
+  { name: 'Amber', value: 'bg-amber-600', border: 'border-amber-300', head: 'bg-amber-500', detail: 'bg-amber-300' },
+  { name: 'Purple', value: 'bg-purple-900', border: 'border-purple-400', head: 'bg-purple-800', detail: 'bg-purple-400' },
+  { name: 'Silver', value: 'bg-slate-100', border: 'border-slate-400', head: 'bg-slate-200', detail: 'bg-slate-400' },
+  { name: 'White', value: 'bg-white', border: 'border-slate-300', head: 'bg-slate-50', detail: 'bg-slate-300' },
+];
+
+type GameStatus = 'idle' | 'playing' | 'gameOver';
+type Character = 'A' | 'B';
+
+interface Obstacle {
+  id: number;
+  x: number;
+  lane: number;
+  type: 'barrier' | 'cone' | 'car';
+  width: number;
+  height: number;
+  color?: string;
+}
+
+export default function App() {
+  // --- Game State ---
+  const [status, setStatus] = useState<GameStatus>('idle');
+  const [distance, setDistance] = useState(0);
+  const [bestDistance, setBestDistance] = useState(() => {
+    const saved = localStorage.getItem('switch-runner-best');
+    return saved ? parseInt(saved, 10) : 0;
+  });
+  const [activeCharacter, setActiveCharacter] = useState<Character>('A');
+  const [isJumping, setIsJumping] = useState(false);
+  const [currentLane, setCurrentLane] = useState(1); // Start in center lane
+  const [obstacles, setObstacles] = useState<Obstacle[]>([]);
+  const [jumpShake, setJumpShake] = useState(false);
+  const [collisionShake, setCollisionShake] = useState(false);
+
+  // --- Customization State ---
+  const [charAColorIdx, setCharAColorIdx] = useState(0);
+  const [charBColorIdx, setCharBColorIdx] = useState(5);
+
+  // --- Refs for Game Loop ---
+  const playerYRef = useRef(GROUND_Y);
+  const playerLaneRef = useRef(1);
+  const velocityYRef = useRef(0);
+  const requestRef = useRef<number>(null);
+  const lastTimeRef = useRef<number>(0);
+  const obstacleTimerRef = useRef<number>(0);
+  const distanceRef = useRef(0);
+  const obstaclesRef = useRef<Obstacle[]>([]);
+
+  // --- Controls ---
+  const jump = useCallback(() => {
+    if (status === 'playing' && playerYRef.current >= GROUND_Y + LANE_Y_OFFSETS[playerLaneRef.current]) {
+      velocityYRef.current = JUMP_FORCE;
+      setIsJumping(true);
+      setJumpShake(true);
+      setTimeout(() => setJumpShake(false), 200);
+    }
+  }, [status]);
+
+  const moveLeft = () => {
+    if (status === 'playing' && playerLaneRef.current > 0) {
+      playerLaneRef.current -= 1;
+      setCurrentLane(playerLaneRef.current);
+    }
+  };
+
+  const moveRight = () => {
+    if (status === 'playing' && playerLaneRef.current < 2) {
+      playerLaneRef.current += 1;
+      setCurrentLane(playerLaneRef.current);
+    }
+  };
+
+  const toggleCharacter = () => {
+    setActiveCharacter((prev) => (prev === 'A' ? 'B' : 'A'));
+  };
+
+  const startGame = () => {
+    setStatus('playing');
+    setDistance(0);
+    distanceRef.current = 0;
+    setObstacles([]);
+    obstaclesRef.current = [];
+    playerLaneRef.current = 1;
+    setCurrentLane(1);
+    playerYRef.current = GROUND_Y + LANE_Y_OFFSETS[1];
+    velocityYRef.current = 0;
+    lastTimeRef.current = performance.now();
+    obstacleTimerRef.current = 0;
+    setCollisionShake(false);
+  };
+
+  const gameOver = () => {
+    setStatus('gameOver');
+    setCollisionShake(true);
+    setTimeout(() => setCollisionShake(false), 500);
+    
+    const currentDist = Math.floor(distanceRef.current);
+    if (currentDist > bestDistance) {
+      setBestDistance(currentDist);
+      localStorage.setItem('switch-runner-best', currentDist.toString());
+    }
+    
+    if (requestRef.current) cancelAnimationFrame(requestRef.current);
+  };
+
+  // --- Game Loop ---
+  const update = (time: number) => {
+    if (status !== 'playing') return;
+
+    const deltaTime = time - lastTimeRef.current;
+    lastTimeRef.current = time;
+
+    const targetGroundY = GROUND_Y + LANE_Y_OFFSETS[playerLaneRef.current];
+
+    // Update Physics
+    velocityYRef.current += GRAVITY;
+    playerYRef.current += velocityYRef.current;
+
+    // Smoothly transition between lanes if not jumping
+    if (!isJumping) {
+      playerYRef.current += (targetGroundY - playerYRef.current) * 0.2;
+    }
+
+    if (playerYRef.current >= targetGroundY) {
+      playerYRef.current = targetGroundY;
+      velocityYRef.current = 0;
+      setIsJumping(false);
+    }
+
+    // Update Distance
+    distanceRef.current += deltaTime * 0.01;
+    setDistance(Math.floor(distanceRef.current));
+
+    // Update Obstacles
+    obstacleTimerRef.current += deltaTime;
+    if (obstacleTimerRef.current > SPAWN_INTERVAL) {
+      const rand = Math.random();
+      let type: 'barrier' | 'cone' | 'car' = 'cone';
+      if (rand > 0.7) type = 'car';
+      else if (rand > 0.4) type = 'barrier';
+
+      const lane = Math.floor(Math.random() * 3);
+      const newObstacle: Obstacle = {
+        id: Date.now(),
+        x: window.innerWidth,
+        lane,
+        type,
+        width: type === 'car' ? 120 : (type === 'barrier' ? 60 : 40),
+        height: type === 'car' ? 60 : (type === 'barrier' ? 40 : 50),
+        color: type === 'car' ? (Math.random() > 0.5 ? 'bg-red-600' : 'bg-blue-600') : undefined
+      };
+      obstaclesRef.current.push(newObstacle);
+      obstacleTimerRef.current = 0;
+    }
+
+    const nextObstacles = obstaclesRef.current
+      .map((obs) => ({ ...obs, x: obs.x - OBSTACLE_SPEED }))
+      .filter((obs) => obs.x + obs.width > 0);
+
+    // Collision Detection
+    for (const obs of nextObstacles) {
+      if (obs.lane === playerLaneRef.current) {
+        const playerRect = {
+          left: PLAYER_X,
+          right: PLAYER_X + PLAYER_WIDTH,
+          top: playerYRef.current - PLAYER_HEIGHT,
+          bottom: playerYRef.current,
+        };
+        const obsRect = {
+          left: obs.x,
+          right: obs.x + obs.width,
+          top: GROUND_Y + LANE_Y_OFFSETS[obs.lane] - obs.height,
+          bottom: GROUND_Y + LANE_Y_OFFSETS[obs.lane],
+        };
+
+        if (
+          playerRect.right > obsRect.left &&
+          playerRect.left < obsRect.right &&
+          playerRect.bottom > obsRect.top &&
+          playerRect.top < obsRect.bottom
+        ) {
+          gameOver();
+          return;
+        }
+      }
+    }
+
+    obstaclesRef.current = nextObstacles;
+    setObstacles([...nextObstacles]);
+
+    requestRef.current = requestAnimationFrame(update);
+  };
+
+  useEffect(() => {
+    if (status === 'playing') {
+      requestRef.current = requestAnimationFrame(update);
+    }
+    return () => {
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+    };
+  }, [status]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.code === 'Space' || e.code === 'ArrowUp') {
+        e.preventDefault();
+        if (status === 'playing') jump();
+        else if (status === 'idle' || status === 'gameOver') startGame();
+      }
+      if (e.code === 'ArrowLeft') {
+        e.preventDefault();
+        moveLeft();
+      }
+      if (e.code === 'ArrowRight') {
+        e.preventDefault();
+        moveRight();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [status, jump]);
+
+  const charAConfig = AVAILABLE_COLORS[charAColorIdx];
+  const charBConfig = AVAILABLE_COLORS[charBColorIdx];
+  const currentConfig = activeCharacter === 'A' ? charAConfig : charBConfig;
+
+  // Calculate jump height for shadow scaling
+  const currentGroundY = GROUND_Y + LANE_Y_OFFSETS[playerLaneRef.current];
+  const jumpHeight = Math.max(0, currentGroundY - playerYRef.current);
+
+  return (
+    <div className={`relative w-full h-screen overflow-hidden bg-[#0a0a20] font-sans select-none transition-transform duration-100 ${collisionShake ? 'animate-shake' : ''}`}>
+      <style>
+        {`
+          @keyframes shake {
+            0% { transform: translate(1px, 1px) rotate(0deg); }
+            10% { transform: translate(-1px, -2px) rotate(-1deg); }
+            20% { transform: translate(-3px, 0px) rotate(1deg); }
+            30% { transform: translate(3px, 2px) rotate(0deg); }
+            40% { transform: translate(1px, -1px) rotate(1deg); }
+            50% { transform: translate(-1px, 2px) rotate(-1deg); }
+            60% { transform: translate(-3px, 1px) rotate(0deg); }
+            70% { transform: translate(3px, 1px) rotate(-1deg); }
+            80% { transform: translate(-1px, -1px) rotate(1deg); }
+            90% { transform: translate(1px, 2px) rotate(0deg); }
+            100% { transform: translate(1px, -2px) rotate(-1deg); }
+          }
+          .animate-shake {
+            animation: shake 0.5s;
+            animation-iteration-count: infinite;
+          }
+        `}
+      </style>
+
+      {/* --- Sky --- */}
+      <div className="absolute inset-0 bg-gradient-to-b from-[#050510] to-[#0a0a20] h-[60%]" />
+      
+      {/* --- Moon --- */}
+      <div className="absolute top-20 right-40 w-24 h-24 rounded-full bg-white/10 blur-xl" />
+      <div className="absolute top-24 right-44 w-16 h-16 rounded-full bg-white/20" />
+
+      {/* --- Road --- */}
+      <div className="absolute bottom-0 w-full h-[45%] bg-[#1a1a1a] perspective-[1000px]">
+        {/* Lane Lines */}
+        <div 
+          className="absolute inset-0"
+          style={{
+            backgroundImage: `
+              linear-gradient(90deg, transparent 48%, rgba(255,255,255,0.1) 48%, rgba(255,255,255,0.1) 52%, transparent 52%),
+              linear-gradient(90deg, transparent 15%, rgba(255,255,255,0.05) 15%, rgba(255,255,255,0.05) 16%, transparent 16%),
+              linear-gradient(90deg, transparent 84%, rgba(255,255,255,0.05) 84%, rgba(255,255,255,0.05) 85%, transparent 85%)
+            `,
+            backgroundSize: '100% 100%',
+          }}
+        />
+        
+        {/* Animated Dashed Center Line */}
+        <div 
+          className="absolute top-1/2 -translate-y-1/2 w-full h-2"
+          style={{
+            backgroundImage: 'linear-gradient(90deg, white 50%, transparent 50%)',
+            backgroundSize: '120px 100%',
+            backgroundPosition: status === 'playing' ? `calc(50% - ${distance * 15}px) 0` : '50% 0',
+            opacity: 0.4
+          }}
+        />
+
+        {/* Lane Indicators (Visual Only) */}
+        <div className="absolute top-0 w-full h-1 bg-white/10" />
+        <div className="absolute bottom-0 w-full h-1 bg-white/10" />
+      </div>
+
+      {/* --- HUD --- */}
+      <div className="absolute top-8 right-8 flex flex-col gap-2 items-end">
+        <div className="text-white font-mono text-2xl bg-black/40 px-4 py-2 rounded-lg border border-white/10 backdrop-blur-sm">
+          <span className="text-white/50 text-sm mr-2 uppercase tracking-widest">Distance</span>
+          {distance.toString().padStart(6, '0')}m
+        </div>
+        <div className="text-amber-400 font-mono text-sm bg-black/40 px-3 py-1 rounded-lg border border-amber-400/20 backdrop-blur-sm">
+          <span className="text-amber-400/50 text-[10px] mr-2 uppercase tracking-widest">Best</span>
+          {bestDistance.toString().padStart(6, '0')}m
+        </div>
+      </div>
+
+      {/* --- Game World --- */}
+      <motion.div 
+        key={status === 'playing' ? 'playing' : 'idle'}
+        initial={status === 'playing' ? { opacity: 0 } : { opacity: 1 }}
+        animate={{ opacity: 1 }}
+        transition={{ duration: 1 }}
+        className="absolute inset-0 pointer-events-none"
+      >
+        {/* Shadow (Stays on road) */}
+        <motion.div
+          animate={{ 
+            x: 0,
+            y: LANE_Y_OFFSETS[playerLaneRef.current],
+            scale: (1 + (playerLaneRef.current - 1) * 0.1) * (1 - jumpHeight / 300)
+          }}
+          transition={{ 
+            y: { duration: 0.1, ease: "linear" },
+            scale: { duration: 0.1 }
+          }}
+          className="absolute left-[150px] bottom-[40%]"
+          style={{ 
+            width: PLAYER_WIDTH, 
+            height: 10,
+            zIndex: 9 + playerLaneRef.current
+          }}
+        >
+          <div className="w-full h-full bg-black/40 rounded-full blur-[4px]" />
+        </motion.div>
+
+        {/* Player Body */}
+        <motion.div
+          animate={{ 
+            y: playerYRef.current - GROUND_Y,
+            x: jumpShake ? [-2, 2, -2, 2, 0] : 0,
+            scale: 1 + (playerLaneRef.current - 1) * 0.1 // Perspective scale
+          }}
+          transition={{ 
+            y: { duration: 0.1, ease: "linear" },
+            x: { duration: 0.2 },
+            scale: { duration: 0.3 }
+          }}
+          className="absolute left-[150px] bottom-[40%]"
+          style={{ 
+            width: PLAYER_WIDTH, 
+            height: PLAYER_HEIGHT,
+            zIndex: 10 + playerLaneRef.current
+          }}
+        >
+          <div className={`w-full h-full rounded-xl shadow-2xl relative transition-colors duration-300 ${currentConfig.value} ${currentConfig.border} border-2`}>
+            {/* Head */}
+            <div className={`absolute -top-10 left-1/2 -translate-x-1/2 w-8 h-8 rounded-full ${currentConfig.head}`} />
+            {/* Visor/Eyes */}
+            <div className="absolute top-2 left-2 right-2 h-4 bg-black/80 rounded-sm" />
+            {/* Detail */}
+            <div className={`absolute bottom-4 left-2 right-2 h-1 rounded-full ${currentConfig.detail}`} />
+          </div>
+        </motion.div>
+
+        {/* Obstacles */}
+        {obstacles.map((obs) => (
+          <div
+            key={obs.id}
+            className="absolute bottom-[40%]"
+            style={{ 
+              left: obs.x, 
+              width: obs.width, 
+              height: obs.height,
+              transform: `translateY(${LANE_Y_OFFSETS[obs.lane]}px) scale(${1 + (obs.lane - 1) * 0.1})`,
+              zIndex: 10 + obs.lane
+            }}
+          >
+            {obs.type === 'car' ? (
+              <div className={`w-full h-full ${obs.color} rounded-lg shadow-xl relative`}>
+                <div className="absolute top-1 left-2 w-8 h-4 bg-sky-200/40 rounded-sm" />
+                <div className="absolute top-1 right-2 w-8 h-4 bg-sky-200/40 rounded-sm" />
+                <div className="absolute -bottom-2 left-2 w-6 h-4 bg-black rounded-sm" />
+                <div className="absolute -bottom-2 right-2 w-6 h-4 bg-black rounded-sm" />
+                <div className="absolute top-1/2 -translate-y-1/2 -left-1 w-2 h-4 bg-yellow-300 rounded-full blur-[2px]" />
+              </div>
+            ) : obs.type === 'barrier' ? (
+              <div className="w-full h-full bg-slate-400 border-b-4 border-slate-600 rounded-t-sm relative shadow-lg">
+                <div className="absolute top-2 left-1 right-1 h-2 bg-slate-500 rounded-sm" />
+                <div className="absolute -bottom-4 left-0 w-2 h-4 bg-slate-700" />
+                <div className="absolute -bottom-4 right-0 w-2 h-4 bg-slate-700" />
+              </div>
+            ) : (
+              <div className="w-full h-full flex flex-col items-center">
+                <div className="w-0 h-0 border-l-[20px] border-l-transparent border-r-[20px] border-r-transparent border-bottom-[50px] border-bottom-orange-500 drop-shadow-md" />
+                <div className="w-full h-2 bg-orange-600 rounded-full -mt-1" />
+                <div className="w-3/4 h-2 bg-white absolute top-1/2 -translate-y-1/2" />
+              </div>
+            )}
+          </div>
+        ))}
+      </motion.div>
+
+      {/* --- UI Controls --- */}
+      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-6">
+        <div className="flex items-center gap-2 bg-white/5 p-1 rounded-full border border-white/10">
+          <button
+            onClick={moveLeft}
+            className="p-3 rounded-full hover:bg-white/10 text-white transition-colors active:scale-90"
+          >
+            <motion.div whileTap={{ x: -5 }}>←</motion.div>
+          </button>
+          <button
+            onClick={toggleCharacter}
+            className="group relative flex items-center gap-3 bg-white/10 hover:bg-white/20 backdrop-blur-md px-6 py-3 rounded-full border border-white/20 transition-all active:scale-95"
+          >
+            <UserRound className={`w-5 h-5 ${activeCharacter === 'A' ? 'text-blue-400' : 'text-slate-200'}`} />
+            <span className="text-white font-medium uppercase tracking-wider text-sm">
+              Switch
+            </span>
+          </button>
+          <button
+            onClick={moveRight}
+            className="p-3 rounded-full hover:bg-white/10 text-white transition-colors active:scale-90"
+          >
+            <motion.div whileTap={{ x: 5 }}>→</motion.div>
+          </button>
+        </div>
+      </div>
+
+      {/* --- Overlays --- */}
+      <AnimatePresence>
+        {status === 'idle' && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="absolute inset-0 bg-black/90 backdrop-blur-md flex flex-col items-center justify-center z-50 p-6 text-center"
+          >
+            <motion.h1 
+              initial={{ y: 20 }}
+              animate={{ y: 0 }}
+              className="text-6xl font-black text-white mb-4 tracking-tighter italic"
+            >
+              SWITCH RUNNER
+            </motion.h1>
+            <p className="text-blue-400 font-mono mb-8 tracking-widest uppercase">
+              Switch characters. Dodge cars. Jump to survive.
+            </p>
+            
+            {/* --- Customization Panel --- */}
+            <div className="bg-white/5 border border-white/10 p-6 rounded-2xl mb-8 w-full max-w-md">
+              <h3 className="text-white/50 text-xs uppercase tracking-[0.3em] mb-6">Customize Characters</h3>
+              
+              <div className="space-y-8">
+                {/* Char A */}
+                <div className="flex flex-col gap-3">
+                  <div className="flex justify-between items-center text-sm">
+                    <span className="text-white/80">Character A</span>
+                    <span className="text-blue-400 font-mono text-xs">{AVAILABLE_COLORS[charAColorIdx].name}</span>
+                  </div>
+                  <div className="flex gap-2 justify-center">
+                    {AVAILABLE_COLORS.map((color, idx) => (
+                      <button
+                        key={`a-${idx}`}
+                        onClick={() => setCharAColorIdx(idx)}
+                        className={`w-8 h-8 rounded-full border-2 transition-all ${color.value} ${
+                          charAColorIdx === idx ? 'border-white scale-110 shadow-[0_0_10px_rgba(255,255,255,0.5)]' : 'border-transparent opacity-50 hover:opacity-100'
+                        }`}
+                      />
+                    ))}
+                  </div>
+                </div>
+
+                {/* Char B */}
+                <div className="flex flex-col gap-3">
+                  <div className="flex justify-between items-center text-sm">
+                    <span className="text-white/80">Character B</span>
+                    <span className="text-slate-400 font-mono text-xs">{AVAILABLE_COLORS[charBColorIdx].name}</span>
+                  </div>
+                  <div className="flex gap-2 justify-center">
+                    {AVAILABLE_COLORS.map((color, idx) => (
+                      <button
+                        key={`b-${idx}`}
+                        onClick={() => setCharBColorIdx(idx)}
+                        className={`w-8 h-8 rounded-full border-2 transition-all ${color.value} ${
+                          charBColorIdx === idx ? 'border-white scale-110 shadow-[0_0_10px_rgba(255,255,255,0.5)]' : 'border-transparent opacity-50 hover:opacity-100'
+                        }`}
+                      />
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <button
+              onClick={startGame}
+              className="group flex items-center gap-4 bg-blue-600 hover:bg-blue-500 text-white px-10 py-5 rounded-full text-xl font-bold transition-all hover:scale-105 active:scale-95 shadow-[0_0_30px_rgba(37,99,235,0.4)]"
+            >
+              <Play className="fill-current" />
+              START ENGINE
+            </button>
+          </motion.div>
+        )}
+
+        {status === 'gameOver' && (
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="absolute inset-0 bg-red-950/90 backdrop-blur-xl flex flex-col items-center justify-center z-50 p-6 text-center"
+          >
+            <h2 className="text-7xl font-black text-white mb-2 tracking-tighter">ROAD BLOCKED</h2>
+            <p className="text-red-400 font-mono mb-8 uppercase tracking-[0.3em]">Engine Failure at {distance}m</p>
+            
+            <button
+              onClick={startGame}
+              className="group flex items-center gap-4 bg-white text-black px-10 py-5 rounded-full text-xl font-bold transition-all hover:scale-105 active:scale-95"
+            >
+              <RotateCcw className="w-6 h-6" />
+              RESTART
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* --- Control Hints --- */}
+      {status === 'playing' && distance < 150 && (
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="absolute bottom-32 left-1/2 -translate-x-1/2 flex gap-8 text-white/30 font-mono text-xs uppercase tracking-[0.3em]"
+        >
+          <span>← → to Switch Lanes</span>
+          <span>Space to Jump</span>
+        </motion.div>
+      )}
+    </div>
+  );
+}
